@@ -15,7 +15,7 @@ const DB_NAME = process.env.DB_NAME || "doctorApp";
 
 app.use(
   cors({
-    origin: ["http://localhost:5173"],
+    origin: ["http://localhost:5173","https://quiet-toffee-0d440b.netlify.app"],
     credentials: true,
   }),
 );
