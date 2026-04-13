@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 
@@ -20,6 +21,96 @@ app.use(
   }),
 );
 app.use(express.json());
+
+// ================= EMAIL SETUP START =================
+
+function getMailCredentials() {
+  const user = (process.env.EMAIL_USER || "").trim();
+  const pass = (process.env.EMAIL_PASS || "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+  return { user, pass };
+}
+
+const smtpPort = Number(process.env.SMTP_PORT || 465);
+const useStarttls587 = smtpPort === 587;
+const smtpSecure = useStarttls587
+  ? false
+  : process.env.SMTP_SECURE
+    ? process.env.SMTP_SECURE === "true"
+    : smtpPort === 465;
+
+// Explicit SMTP (more reliable than service: "gmail" on some networks)
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || "smtp.gmail.com",
+  port: smtpPort,
+  secure: smtpSecure,
+  requireTLS: useStarttls587,
+  auth: getMailCredentials(),
+});
+
+// optional: verify connection
+transporter.verify((error) => {
+  if (error) {
+    console.log("❌ Email server error:", error);
+  } else {
+    console.log("✅ Email server is ready");
+  }
+});
+
+// send email function — returns result so API can surface delivery status
+const sendEmail = async (to, subject, html) => {
+  const { user, pass } = getMailCredentials();
+  console.log("[sendEmail] invoked", {
+    to: to ? String(to) : to,
+    subject,
+    htmlLength: html ? String(html).length : 0,
+    smtpUserConfigured: Boolean(user),
+  });
+  if (!to || !String(to).trim()) {
+    console.warn("[sendEmail] skipped: missing or empty recipient address");
+    return { ok: false, code: "NO_RECIPIENT", message: "Patient email missing on appointment." };
+  }
+  if (!user || !pass) {
+    console.error("[sendEmail] EMAIL_USER or EMAIL_PASS missing/empty in .env");
+    return { ok: false, code: "SMTP_CONFIG", message: "Set EMAIL_USER and EMAIL_PASS in backend/.env" };
+  }
+  try {
+    const info = await transporter.sendMail({
+      from: `"Doctor Appointment System" <${user}>`,
+      to: String(to).trim(),
+      subject,
+      html,
+    });
+
+    console.log("[sendEmail] sendMail finished", {
+      messageId: info.messageId,
+      response: info.response,
+      accepted: info.accepted,
+      rejected: info.rejected,
+    });
+
+    if (info.rejected && info.rejected.length > 0) {
+      return {
+        ok: false,
+        code: "SMTP_REJECT",
+        message: `Rejected: ${info.rejected.join(", ")}`,
+        response: info.response,
+      };
+    }
+
+    return { ok: true, messageId: info.messageId, response: info.response };
+  } catch (error) {
+    console.error("[sendEmail] error:", error && error.message ? error.message : error);
+    return {
+      ok: false,
+      code: "SMTP_ERROR",
+      message: error.message || String(error),
+    };
+  }
+};
+
+// ================= EMAIL SETUP END =================
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.yl5czei.mongodb.net/?retryWrites=true&w=majority`;
 
@@ -344,6 +435,32 @@ async function run() {
       };
 
       const insert = await appointmentsCollection.insertOne(item);
+      // ================= EMAIL ON BOOKING =================
+
+// patient email
+const userHtml = `
+  <h2>Appointment Requested ✅</h2>
+  <p>Hello ${patient.name},</p>
+  <p>Your appointment request has been sent successfully.</p>
+  <p><b>Doctor:</b> ${doctor.name}</p>
+  <p><b>Date:</b> ${date}</p>
+  <p>Status: Pending</p>
+`;
+
+// doctor email
+const doctorHtml = `
+  <h2>New Appointment Request 📢</h2>
+  <p>Doctor ${doctor.name},</p>
+  <p>You have a new appointment request.</p>
+  <p><b>Patient:</b> ${patient.name}</p>
+  <p><b>Date:</b> ${date}</p>
+`;
+
+// send emails (non-blocking)
+sendEmail(patient.email, "Appointment Request Sent", userHtml);
+sendEmail(doctor.email, "New Appointment Request", doctorHtml);
+
+// ================= EMAIL END =================
       res
         .status(201)
         .send({ success: true, appointment: sanitizeAppointment({ ...item, _id: insert.insertedId }) });
@@ -391,6 +508,13 @@ async function run() {
       }
       const allowedStatuses = ["Pending", "Approved", "Completed", "Cancelled"];
       const { status } = req.body || {};
+      console.log("[PATCH /appointments/:id/status]", {
+        appointmentId: req.params.id,
+        body: req.body,
+        status,
+        role: req.user.role,
+        hasAuth: Boolean(req.headers.authorization),
+      });
       if (!allowedStatuses.includes(status)) {
         return res.status(400).send({ success: false, message: "Invalid status." });
       }
@@ -411,8 +535,59 @@ async function run() {
         { _id: item._id },
         { $set: { status, updatedAt: new Date().toISOString() } },
       );
-      const updated = await appointmentsCollection.findOne({ _id: item._id });
-      res.send({ success: true, appointment: sanitizeAppointment(updated) });
+      let updated = await appointmentsCollection.findOne({ _id: item._id });
+      // ================= EMAIL ON STATUS UPDATE =================
+      let patientEmail = updated.patientEmail && String(updated.patientEmail).trim();
+      if (!patientEmail && updated.patientId) {
+        try {
+          const patientUser = await usersCollection.findOne({
+            _id: new ObjectId(updated.patientId),
+          });
+          patientEmail = patientUser?.email ? String(patientUser.email).trim() : "";
+          console.log("[PATCH /appointments/:id/status] resolved patientEmail from users", {
+            found: Boolean(patientUser),
+            patientEmail: patientEmail || null,
+          });
+        } catch (lookupErr) {
+          console.warn("[PATCH /appointments/:id/status] patient email lookup failed", lookupErr);
+        }
+      }
+      if (patientEmail && (!updated.patientEmail || !String(updated.patientEmail).trim())) {
+        await appointmentsCollection.updateOne(
+          { _id: item._id },
+          { $set: { patientEmail, updatedAt: new Date().toISOString() } },
+        );
+        updated = await appointmentsCollection.findOne({ _id: item._id });
+      }
+
+      const statusHtml = `
+  <h2>Appointment Update 🔔</h2>
+  <p>Hello ${updated.patientName || "Patient"},</p>
+  <p>Your appointment status is now: <b>${status}</b></p>
+  <p><b>Doctor:</b> ${updated.doctorName || ""}</p>
+  <p><b>Date:</b> ${updated.date || ""}</p>
+`;
+
+      const emailSubject =
+        status === "Approved" ? "Appointment Approved" : "Appointment Status Updated";
+      console.log("[PATCH /appointments/:id/status] before sendEmail", {
+        status,
+        subject: emailSubject,
+        patientEmailOnDoc: updated.patientEmail || null,
+        resolvedPatientEmail: patientEmail || null,
+      });
+      const emailNotification = await sendEmail(
+        patientEmail,
+        emailSubject,
+        statusHtml,
+      );
+
+      // ================= EMAIL END =================
+      res.send({
+        success: true,
+        appointment: sanitizeAppointment(updated),
+        emailNotification,
+      });
     });
 
     app.patch("/appointments/:id", authRequired, async (req, res) => {
@@ -459,19 +634,19 @@ async function run() {
       res.send({ success: true, deleted: true });
     });
 
+    app.get("/", (req, res) => {
+      res.send("doctor is running");
+    });
+
     await client.db("admin").command({ ping: 1 });
     console.log("MongoDB connected");
+
+    app.listen(port, () => {
+      console.log(`doctor server running on port ${port}`);
+    });
   } finally {
     // keep connection open
   }
 }
 
 run().catch(console.dir);
-
-app.get("/", (req, res) => {
-  res.send("doctor is running");
-});
-
-app.listen(port, () => {
-  console.log(`doctor server running on port ${port}`);
-});
